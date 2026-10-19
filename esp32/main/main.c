@@ -1,8 +1,8 @@
 #define WIFI_SSID   "Sameer's S23 Ultra"
 #define WIFI_PASS   "11225799"
-#define PC_HOST_IP  "192.168.1.100"   // <-- PC's IP  )`ip a`)
-#define GATEWAY_PORT 5000             // port this ESP32
-#define PC_PORT      5000             // port the PC server.py
+#define GATEWAY_PORT   5000           // port this ESP32 listens on for nodes
+#define PC_PORT        5000           // port the PC server.py listens on
+#define DISCOVERY_PORT 4999
 
 #include <string.h>
 #include <stdio.h>
@@ -31,6 +31,7 @@ static u8g2_t u8g2;
 static bool wifi_connected = false;
 static int msg_count = 0;
 static char last_msg[64] = "waiting...";
+static char pc_ip[16] = "";
 
 
 
@@ -113,12 +114,73 @@ static void display_update(void)
 
 
 
+
+static void discovery_task(void *pvParameters)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "discovery: socket() failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int yes = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(DISCOVERY_PORT);
+    if (bind(sock, (struct sockaddr *)&local, sizeof(local)) != 0) {
+        ESP_LOGE(TAG, "discovery: bind() failed");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in bcast = {0};
+    bcast.sin_family = AF_INET;
+    bcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    bcast.sin_port = htons(DISCOVERY_PORT);
+
+    TickType_t last_beacon = 0;
+    while (1) {
+        if (xTaskGetTickCount() - last_beacon >= pdMS_TO_TICKS(2000)) {
+            sendto(sock, "GATEWAY", 7, 0, (struct sockaddr *)&bcast, sizeof(bcast));
+            last_beacon = xTaskGetTickCount();
+        }
+
+        char buf[16] = {0};
+        struct sockaddr_in src;
+        socklen_t src_len = sizeof(src);
+        int len = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&src, &src_len);
+        if (len == 2 && strncmp(buf, "PC", 2) == 0) {
+            char ip[16];
+            inet_ntoa_r(src.sin_addr, ip, sizeof(ip));
+            if (strcmp(ip, pc_ip) != 0) {
+                ESP_LOGI(TAG, "PC server found at %s", ip);
+                strncpy(pc_ip, ip, sizeof(pc_ip) - 1);
+                pc_ip[sizeof(pc_ip) - 1] = '\0';
+            }
+        }
+    }
+}
+
 static void forward_to_pc(const char *line)
 {
+    if (pc_ip[0] == '\0') {
+        ESP_LOGW(TAG, "forward_to_pc: PC not discovered yet (is server.py running?)");
+        return;
+    }
+
     struct sockaddr_in dest = {0};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(PC_PORT);
-    dest.sin_addr.s_addr = inet_addr(PC_HOST_IP);
+    dest.sin_addr.s_addr = inet_addr(pc_ip);
 
     int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock < 0) {
@@ -127,7 +189,7 @@ static void forward_to_pc(const char *line)
     }
 
     if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
-        ESP_LOGW(TAG, "forward_to_pc: could not reach %s:%d", PC_HOST_IP, PC_PORT);
+        ESP_LOGW(TAG, "forward_to_pc: could not reach %s:%d", pc_ip, PC_PORT);
         close(sock);
         return;
     }
@@ -209,5 +271,6 @@ void app_main(void)
     }
     display_update();
 
+    xTaskCreate(discovery_task, "discovery_task", 4096, NULL, 4, NULL);
     xTaskCreate(tcp_server_task, "tcp_server_task", 4096, NULL, 5, NULL);
 }

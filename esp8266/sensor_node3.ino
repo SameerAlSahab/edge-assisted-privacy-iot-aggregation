@@ -1,11 +1,16 @@
 #include <ESP8266WiFi.h>
+#include <WiFiUdp.h>
 
 const char *NODE_NAME = "node3";
 const char *WIFI_SSID = "Sameer's S23 Ultra";
 const char *WIFI_PASS = "11225799";
-const char *GATEWAY_IP = "192.168.1.101";
 const uint16_t GATEWAY_PORT = 5000;
+const uint16_t DISCOVERY_PORT = 4999;
 const unsigned long SEND_INTERVAL_MS = 2000;
+
+WiFiUDP udp;
+IPAddress gatewayIP;
+bool haveGateway = false;
 
 void connectWiFi() {
   Serial.print("Connecting to ");
@@ -20,12 +25,40 @@ void connectWiFi() {
   Serial.println();
   Serial.print("Connected. IP: ");
   Serial.println(WiFi.localIP());
+
+  udp.begin(DISCOVERY_PORT);
+  haveGateway = false;
+}
+
+
+void pollBeacons() {
+  while (udp.parsePacket() > 0) {
+    char buf[16];
+    int len = udp.read(buf, sizeof(buf) - 1);
+    if (len <= 0) continue;
+    buf[len] = '\0';
+    if (strcmp(buf, "GATEWAY") == 0) {
+      IPAddress ip = udp.remoteIP();
+      if (!haveGateway || ip != gatewayIP) {
+        Serial.print("Gateway found: ");
+        Serial.println(ip);
+      }
+      gatewayIP = ip;
+      haveGateway = true;
+    }
+  }
 }
 
 void sendReading() {
+  if (!haveGateway) {
+    Serial.println("Waiting for gateway beacon...");
+    return;
+  }
+
   WiFiClient client;
-  if (!client.connect(GATEWAY_IP, GATEWAY_PORT)) {
+  if (!client.connect(gatewayIP, GATEWAY_PORT)) {
     Serial.println("Could not reach gateway, will retry next cycle");
+    haveGateway = false;
     return;
   }
 
@@ -50,6 +83,7 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
+  pollBeacons();
   sendReading();
   delay(SEND_INTERVAL_MS);
 }
